@@ -65,8 +65,10 @@ public class ResourceUtils {
         Path toVisit = fileSystem.getPath(firstPathComponent, remainingPathComponents);
         if (Files.exists(toVisit)) {
           consumer.accept(toVisit);
+          fileSystem.close();
           return true;
         }
+        fileSystem.close();
         return false;
       }
     } else {

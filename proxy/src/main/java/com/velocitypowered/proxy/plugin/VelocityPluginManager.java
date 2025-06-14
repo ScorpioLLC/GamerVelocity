@@ -94,92 +94,99 @@ public class VelocityPluginManager implements PluginManager {
     Map<String, PluginDescription> foundCandidates = new LinkedHashMap<>();
     JavaPluginLoader loader = new JavaPluginLoader(server, directory);
 
-    try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory,
-        p -> p.toFile().isFile() && p.toString().endsWith(".jar"))) {
+    // GamerVelocity - Wrap in try catch, and close stream at the end
+    try {
+      DirectoryStream<Path> stream = Files.newDirectoryStream(directory,
+              p -> p.toFile().isFile() && p.toString().endsWith(".jar"));
+
       for (Path path : stream) {
         try {
           PluginDescription candidate = loader.loadCandidate(path);
 
           // If we found a duplicate candidate (with the same ID), don't load it.
           PluginDescription maybeExistingCandidate = foundCandidates.putIfAbsent(
-              candidate.getId(), candidate);
+                  candidate.getId(), candidate);
 
           if (maybeExistingCandidate != null) {
             logger.error("Refusing to load plugin at path {} since we already "
-                    + "loaded a plugin with the same ID {} from {}",
-                candidate.getSource().map(Objects::toString).orElse("<UNKNOWN>"),
-                candidate.getId(),
-                maybeExistingCandidate.getSource().map(Objects::toString).orElse("<UNKNOWN>"));
+                            + "loaded a plugin with the same ID {} from {}",
+                    candidate.getSource().map(Objects::toString).orElse("<UNKNOWN>"),
+                    candidate.getId(),
+                    maybeExistingCandidate.getSource().map(Objects::toString).orElse("<UNKNOWN>"));
           }
         } catch (Throwable e) {
           logger.error("Unable to load plugin {}", path, e);
         }
       }
-    }
 
-    if (foundCandidates.isEmpty()) {
-      // No plugins found
-      return;
-    }
+      if (foundCandidates.isEmpty()) {
+        // No plugins found
+        return;
+      }
 
-    List<PluginDescription> sortedPlugins = PluginDependencyUtils.sortCandidates(
-        new ArrayList<>(foundCandidates.values()));
+      List<PluginDescription> sortedPlugins = PluginDependencyUtils.sortCandidates(
+              new ArrayList<>(foundCandidates.values()));
 
-    Map<String, PluginDescription> loadedCandidates = new HashMap<>();
-    Map<PluginContainer, Module> pluginContainers = new LinkedHashMap<>();
-    // Now load the plugins
-    pluginLoad:
-    for (PluginDescription candidate : sortedPlugins) {
-      // Verify dependencies
-      for (PluginDependency dependency : candidate.getDependencies()) {
-        if (!dependency.isOptional() && !loadedCandidates.containsKey(dependency.getId())) {
-          logger.error("Can't load plugin {} due to missing dependency {}", candidate.getId(),
-              dependency.getId());
-          continue pluginLoad;
+      Map<String, PluginDescription> loadedCandidates = new HashMap<>();
+      Map<PluginContainer, Module> pluginContainers = new LinkedHashMap<>();
+      // Now load the plugins
+      pluginLoad:
+      for (PluginDescription candidate : sortedPlugins) {
+        // Verify dependencies
+        for (PluginDependency dependency : candidate.getDependencies()) {
+          if (!dependency.isOptional() && !loadedCandidates.containsKey(dependency.getId())) {
+            logger.error("Can't load plugin {} due to missing dependency {}", candidate.getId(),
+                    dependency.getId());
+            continue pluginLoad;
+          }
+        }
+
+        try {
+          PluginDescription realPlugin = loader.createPluginFromCandidate(candidate);
+          VelocityPluginContainer container = new VelocityPluginContainer(realPlugin);
+          pluginContainers.put(container, loader.createModule(container));
+          loadedCandidates.put(realPlugin.getId(), realPlugin);
+        } catch (Throwable e) {
+          logger.error("Can't create module for plugin {}", candidate.getId(), e);
         }
       }
 
-      try {
-        PluginDescription realPlugin = loader.createPluginFromCandidate(candidate);
-        VelocityPluginContainer container = new VelocityPluginContainer(realPlugin);
-        pluginContainers.put(container, loader.createModule(container));
-        loadedCandidates.put(realPlugin.getId(), realPlugin);
-      } catch (Throwable e) {
-        logger.error("Can't create module for plugin {}", candidate.getId(), e);
-      }
-    }
-
-    // Make a global Guice module that with common bindings for every plugin
-    AbstractModule commonModule = new AbstractModule() {
-      @Override
-      protected void configure() {
-        bind(ProxyServer.class).toInstance(server);
-        bind(PluginManager.class).toInstance(server.getPluginManager());
-        bind(EventManager.class).toInstance(server.getEventManager());
-        bind(CommandManager.class).toInstance(server.getCommandManager());
-        for (PluginContainer container : pluginContainers.keySet()) {
-          bind(PluginContainer.class)
-              .annotatedWith(Names.named(container.getDescription().getId()))
-              .toInstance(container);
+      // Make a global Guice module that with common bindings for every plugin
+      AbstractModule commonModule = new AbstractModule() {
+        @Override
+        protected void configure() {
+          bind(ProxyServer.class).toInstance(server);
+          bind(PluginManager.class).toInstance(server.getPluginManager());
+          bind(EventManager.class).toInstance(server.getEventManager());
+          bind(CommandManager.class).toInstance(server.getCommandManager());
+          for (PluginContainer container : pluginContainers.keySet()) {
+            bind(PluginContainer.class)
+                    .annotatedWith(Names.named(container.getDescription().getId()))
+                    .toInstance(container);
+          }
         }
+      };
+
+      for (Map.Entry<PluginContainer, Module> plugin : pluginContainers.entrySet()) {
+        PluginContainer container = plugin.getKey();
+        PluginDescription description = container.getDescription();
+
+        try {
+          loader.createPlugin(container, plugin.getValue(), commonModule);
+        } catch (Throwable e) {
+          logger.error("Can't create plugin {}", description.getId(), e);
+          continue;
+        }
+
+        logger.info("Loaded plugin {} {} by {}", description.getId(), description.getVersion()
+                .orElse("<UNKNOWN>"), Joiner.on(", ").join(description.getAuthors()));
+        registerPlugin(container);
       }
-    };
-
-    for (Map.Entry<PluginContainer, Module> plugin : pluginContainers.entrySet()) {
-      PluginContainer container = plugin.getKey();
-      PluginDescription description = container.getDescription();
-
-      try {
-        loader.createPlugin(container, plugin.getValue(), commonModule);
-      } catch (Throwable e) {
-        logger.error("Can't create plugin {}", description.getId(), e);
-        continue;
-      }
-
-      logger.info("Loaded plugin {} {} by {}", description.getId(), description.getVersion()
-          .orElse("<UNKNOWN>"), Joiner.on(", ").join(description.getAuthors()));
-      registerPlugin(container);
+      stream.close();
+    } catch (Exception ex) {
+      logger.warn("Failed to load plugins", ex);
     }
+    // GamerVelocity End
   }
 
   @Override
